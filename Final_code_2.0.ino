@@ -28,7 +28,6 @@ WebServer server(80);
 // Encoder pins for X and Y axes
 #define ENCODER_Y_PIN 34
 #define ENCODER_X_PIN 35
-#define ENCODER_Y_A_PIN 38
 
 // LED indicators
 #define LED_GREEN 4
