@@ -51,6 +51,8 @@ WebServer server(80);
 int currentServoAngle = PEN_UP_ANGLE;   // Variable to store the current servo angle
 
 // ------------------------ MOTOR PWM CONFIG ------------------------
+volatile bool manualModeActive = false;
+#define RPM_TIMEOUT_US 250000UL  // 250 milliseconds (in microseconds)
 #define PWM_FREQ 1000                     // PWM frequency for motor control
 #define PWM_RESOLUTION_MOTOR LEDC_TIMER_8_BIT // PWM resolution for motor control
 #define PWM_TIMER LEDC_TIMER_0            // PWM timer for motor control
@@ -72,7 +74,8 @@ unsigned long lastPrintTime = 0;       // Time stamp for printing RPM data
 float TARGET_RPM_X = 150;              
 float TARGET_RPM_Y = 150;
 
-#define BASE_PWM 80                     // Base PWM value for motor control
+#define BASE_PWM 80   // Base PWM value for motor control
+#define MAX_PWM 220  // Safe max PWM to avoid overshoot
 
 // PID control constants (for tuning the speed control)
 float Kp = 10.0, Ki = 0.2, Kd = 0.25;  // Proportional, Integral, Derivative constants
@@ -97,22 +100,26 @@ void setLEDState(bool green, bool yellow, bool red) {
 
 // ------------------------ ENCODER INTERRUPTS ------------------------
 void IRAM_ATTR encoderYISR() {
-  unsigned long currentTime = micros(); // Get the current time in microseconds
-  if (currentTime - lastYTime > DEBOUNCE_DELAY) {  // Ensure enough time has passed for debounce
-    unsigned long delta = currentTime - lastYTime;  // Calculate time since last interrupt
-    if (delta > 1000 && delta < 500000)  // Ignore very fast or very slow pulses
-      yRPM = (60000000.0 / delta) / slotsPerRevolution;  // Calculate RPM from time difference
-    lastYTime = currentTime;  // Update the last time
+  unsigned long currentTime = micros();
+  if (currentTime - lastYTime > DEBOUNCE_DELAY) {
+    unsigned long delta = currentTime - lastYTime;
+    if (delta > 1000 && delta < 500000) {
+      float newRPM = (60000000.0 / delta) / slotsPerRevolution;
+      yRPM = 0.8 * yRPM + 0.2 * newRPM;  // Smooth update
+    }
+    lastYTime = currentTime;
   }
 }
 
 void IRAM_ATTR encoderXISR() {
-  unsigned long currentTime = micros(); // Get the current time in microseconds
-  if (currentTime - lastXTime > DEBOUNCE_DELAY) {  // Ensure enough time has passed for debounce
-    unsigned long delta = currentTime - lastXTime;  // Calculate time since last interrupt
-    if (delta > 1000 && delta < 500000)  // Ignore very fast or very slow pulses
-      xRPM = (60000000.0 / delta) / slotsPerRevolution;  // Calculate RPM from time difference
-    lastXTime = currentTime;  // Update the last time
+  unsigned long currentTime = micros();
+  if (currentTime - lastXTime > DEBOUNCE_DELAY) {
+    unsigned long delta = currentTime - lastXTime;
+    if (delta > 1000 && delta < 500000) {
+      float newRPM = (60000000.0 / delta) / slotsPerRevolution;
+      xRPM = 0.8 * xRPM + 0.2 * newRPM;  // Smooth update
+    }
+    lastXTime = currentTime;
   }
 }
 
@@ -177,40 +184,33 @@ void moveServo(int targetAngle) {
 }
 
 // ------------------------ PID CONTROL ------------------------
-void applyPID_X(int dir) {
-  // Check if the limit switch is pressed for the X axis and stop motor if necessary
-  if ((dir > 0 && digitalRead(X_LIMIT_RIGHT) == LOW) || (dir < 0 && digitalRead(X_LIMIT_LEFT) == LOW)) {
+void applyPID(
+  float& currentRPM, float targetRPM,
+  float& integral, float& prevError,
+  ledc_channel_t chForward, ledc_channel_t chBackward,
+  int dir, int limitHigh, int limitLow
+) {
+  // Check limits
+  if ((dir > 0 && digitalRead(limitHigh) == LOW) || 
+      (dir < 0 && digitalRead(limitLow) == LOW)) {
     stopMotor(); return;
   }
-  // PID control logic for X axis movement
-  float error = TARGET_RPM_X - xRPM;                    // Calculate RPM error
-  integralX += error;                                    // Accumulate the error for integral term
-  integralX = constrain(integralX, -500, 500);           // Prevent integral windup
-  float output = Kp * error + Ki * integralX + Kd * (error - previousErrorX);  // Calculate PID output
-  int speed = constrain(BASE_PWM + abs(output), 0, 255); // Calculate motor speed
-  ledc_set_duty(PWM_SPEED_MODE, IN3_CHANNEL, dir > 0 ? speed : 0);  // Set PWM duty for IN3
-  ledc_set_duty(PWM_SPEED_MODE, IN4_CHANNEL, dir < 0 ? speed : 0);  // Set PWM duty for IN4
-  ledc_update_duty(PWM_SPEED_MODE, IN3_CHANNEL);          // Update PWM duty cycle
-  ledc_update_duty(PWM_SPEED_MODE, IN4_CHANNEL);          // Update PWM duty cycle
-  previousErrorX = error;                                // Update previous error for next iteration
-}
 
-void applyPID_Y(int dir) {
-  // Check if the limit switch is pressed for the Y axis and stop motor if necessary
-  if ((dir > 0 && digitalRead(Y_LIMIT_TOP) == LOW) || (dir < 0 && digitalRead(Y_LIMIT_BOTTOM) == LOW)) {
-    stopMotor(); return;
-  }
-  // PID control logic for Y axis movement
-  float error = TARGET_RPM_Y - yRPM;                    // Calculate RPM error
-  integralY += error;                                    // Accumulate the error for integral term
-  integralY = constrain(integralY, -500, 500);           // Prevent integral windup
-  float output = Kp * error + Ki * integralY + Kd * (error - previousErrorY);  // Calculate PID output
-  int speed = constrain(BASE_PWM + abs(output), 0, 255); // Calculate motor speed
-  ledc_set_duty(PWM_SPEED_MODE, IN1_CHANNEL, dir > 0 ? speed : 0);  // Set PWM duty for IN1
-  ledc_set_duty(PWM_SPEED_MODE, IN2_CHANNEL, dir < 0 ? speed : 0);  // Set PWM duty for IN2
-  ledc_update_duty(PWM_SPEED_MODE, IN1_CHANNEL);          // Update PWM duty cycle
-  ledc_update_duty(PWM_SPEED_MODE, IN2_CHANNEL);          // Update PWM duty cycle
-  previousErrorY = error;                                // Update previous error for next iteration
+  // PID Calculation
+  float error = targetRPM - currentRPM;
+  integral += error;
+  float maxIntegral = 1000.0 / (Kp + 0.01);  // Prevent divide by zero
+  integral = constrain(integral, -maxIntegral, maxIntegral);
+  float output = Kp * error + Ki * integral + Kd * (error - prevError);
+  int speed = constrain(BASE_PWM + abs(output), 0, MAX_PWM);
+
+  // Set PWM
+  ledc_set_duty(PWM_SPEED_MODE, chForward, dir > 0 ? speed : 0);
+  ledc_set_duty(PWM_SPEED_MODE, chBackward, dir < 0 ? speed : 0);
+  ledc_update_duty(PWM_SPEED_MODE, chForward);
+  ledc_update_duty(PWM_SPEED_MODE, chBackward);
+
+  prevError = error;
 }
 
 // Set target RPMs dynamically
@@ -230,44 +230,27 @@ void timedMove(int dirX, int dirY, unsigned long durationMs) {
       emergencyStop();  // Trigger emergency stop if the button is pressed
       return;  // Exit the function immediately
     }
-    applyPID_X(dirX);   // Apply PID control for X axis
-    applyPID_Y(dirY);   // Apply PID control for Y axis
-    delay(5);           // Small delay to avoid overloading the system
+    applyPID(xRPM, TARGET_RPM_X, integralX, previousErrorX, IN3_CHANNEL, IN4_CHANNEL, dirX, X_LIMIT_RIGHT, X_LIMIT_LEFT);
+    applyPID(yRPM, TARGET_RPM_Y, integralY, previousErrorY, IN1_CHANNEL, IN2_CHANNEL, dirY, Y_LIMIT_TOP, Y_LIMIT_BOTTOM);
+    delay(5); // Small delay to avoid overloading the system
   }
   stopMotor();  // Stop the motors when the movement is complete
 }
 
-void timedMoveDiagonal(int dirX, int dirY, unsigned long durationMs) {
-  unsigned long start = millis();
-  while (millis() - start < durationMs) {
-    // Check RPMs live
-    checkRPM();
-    // Check for emergency stop during diagonal movement
-    if (digitalRead(EMERGENCY_STOP_PIN) == LOW) {
-      emergencyStop();  // Trigger emergency stop if the button is pressed
-      return;  // Exit the function immediately
-    }
-    applyPID_X(dirX);   // Apply PID control for X axis
-    applyPID_Y(dirY);   // Apply PID control for Y axis
-    delay(5);           // Small delay to avoid overloading the system
-  }
-  stopMotor();  // Stop the motors when the movement is complete
-}
-
-void driveX(int dir) { applyPID_X(dir); }
-void driveY(int dir) { applyPID_Y(dir); }
+void driveX(int dir) { applyPID(xRPM, TARGET_RPM_X, integralX, previousErrorX, IN3_CHANNEL, IN4_CHANNEL, dir, X_LIMIT_RIGHT, X_LIMIT_LEFT); }
+void driveY(int dir) { applyPID(yRPM, TARGET_RPM_Y, integralY, previousErrorY, IN1_CHANNEL, IN2_CHANNEL, dir, Y_LIMIT_TOP, Y_LIMIT_BOTTOM); }
 
 void driveXY(int dirX, int dirY) {
   unsigned long moveDuration = 50;
   unsigned long interval = 5;
   unsigned long lastYUpdate = 0;
-  float ratio = (float)TARGET_RPM_Y / TARGET_RPM_X;
+  float ratio = (TARGET_RPM_X != 0) ? ((float)TARGET_RPM_Y / TARGET_RPM_X) : 1.0;
   unsigned long start = millis();
   while (millis() - start < moveDuration) {
     unsigned long now = millis();
-    applyPID_X(dirX);
+    applyPID(xRPM, TARGET_RPM_X, integralX, previousErrorX, IN3_CHANNEL, IN4_CHANNEL, dirX, X_LIMIT_RIGHT, X_LIMIT_LEFT);
     if ((now - lastYUpdate) >= (interval * ratio)) {
-      applyPID_Y(dirY);
+      applyPID(yRPM, TARGET_RPM_Y, integralY, previousErrorY, IN1_CHANNEL, IN2_CHANNEL, dirY, Y_LIMIT_TOP, Y_LIMIT_BOTTOM);
       lastYUpdate = now;
     }
     delay(1);
@@ -275,21 +258,19 @@ void driveXY(int dirX, int dirY) {
 }
 
 void manualMove(int dirX, int dirY) {
-  // Check for limit switch status and stop movement if necessary
-  while (true) {
+  manualModeActive = true;
+  while (manualModeActive) {
     if ((dirX > 0 && digitalRead(X_LIMIT_RIGHT) == LOW) || (dirX < 0 && digitalRead(X_LIMIT_LEFT) == LOW)) {
-      stopMotor();
-      return; // Exit if limit switch is pressed for X axis
+      stopMotor(); break;
     }
-    
+
     if ((dirY > 0 && digitalRead(Y_LIMIT_TOP) == LOW) || (dirY < 0 && digitalRead(Y_LIMIT_BOTTOM) == LOW)) {
-      stopMotor();
-      return; // Exit if limit switch is pressed for Y axis
+      stopMotor(); break;
     }
 
     // PID control logic for manual X and Y axis movement
-    applyPID_X(dirX);  // Move X axis
-    applyPID_Y(dirY);  // Move Y axis
+    applyPID(xRPM, TARGET_RPM_X, integralX, previousErrorX, IN3_CHANNEL, IN4_CHANNEL, dirX, X_LIMIT_RIGHT, X_LIMIT_LEFT);
+    applyPID(yRPM, TARGET_RPM_Y, integralY, previousErrorY, IN1_CHANNEL, IN2_CHANNEL, dirY, Y_LIMIT_TOP, Y_LIMIT_BOTTOM);
     delay(5);  // Small delay to avoid overloading the system
   }
 }
@@ -402,18 +383,18 @@ void calibrateMovement() {
 }
 
 void checkRPM() {
-  // Print or log the actual and target RPM for X and Y axes
+  unsigned long now = micros();
+
+  // Timeout-based decay to 0 RPM if no pulses recently
+  if (now - lastXTime > RPM_TIMEOUT_US) xRPM = 0;
+  if (now - lastYTime > RPM_TIMEOUT_US) yRPM = 0;
+
+
   Serial.print("X RPM: "); Serial.print(xRPM); Serial.print(" / Target: "); Serial.print(TARGET_RPM_X);
   Serial.print("  |  Y RPM: "); Serial.print(yRPM); Serial.print(" / Target: "); Serial.println(TARGET_RPM_Y);
-  
-  // Check if RPM is within a tolerable range of the target RPM
-  if (abs(xRPM - TARGET_RPM_X) > 5) {  // 5 RPM tolerance (you can adjust this value)
-    Serial.println("Warning: X axis RPM deviates from target!");
-  }
-  
-  if (abs(yRPM - TARGET_RPM_Y) > 5) {  // 5 RPM tolerance (you can adjust this value)
-    Serial.println("Warning: Y axis RPM deviates from target!");
-  }
+
+  if (abs(xRPM - TARGET_RPM_X) > 5) Serial.println("Warning: X axis RPM deviates from target!");
+  if (abs(yRPM - TARGET_RPM_Y) > 5) Serial.println("Warning: Y axis RPM deviates from target!");
 }
 
 // ------------------------ DRAWING ------------------------
@@ -483,35 +464,35 @@ void drawNikolausHouse() {
   checkRPM();
   delay(pauseTime);
 
-  // Set target RPM and use timedMoveDiagonal for diagonal movements
+  // Set target RPM for diagonal movements
   setTargetRPM(150, 150);
 
-  // Use timedMoveDiagonal for the long diagonal (lower left to upper right)
-  timedMoveDiagonal(1, 1, ldiagTime);  // Diagonal movement (X and Y move simultaneously)
+  // Use timedMove for the long diagonal (lower left to upper right)
+  timedMove(1, 1, ldiagTime);  // Diagonal movement (X and Y move simultaneously)
   normalStop();                        // Normal stop after the diagonal move
   setLEDState(false, true, false); // Yellow on
   checkLidStatus(); //Check status of LID
   checkRPM();
   delay(pauseTime);
 
-  // Use timedMoveDiagonal for the small diagonal (upper right to lower left)
-  timedMoveDiagonal(-1, 1, sdiagTime);  // Diagonal movement (X moves left, Y moves up)
+  // Use timedMove for the small diagonal (upper right to lower left)
+  timedMove(-1, 1, sdiagTime);  // Diagonal movement (X moves left, Y moves up)
   normalStop();                         // Normal stop after the diagonal move
   setLEDState(false, true, false); // Yellow on
   checkLidStatus(); //Check status of LID
   checkRPM();
   delay(pauseTime);
 
-  // Use timedMoveDiagonal for the small diagonal (lower left to upper right)
-  timedMoveDiagonal(-1, -1, sdiagTime);  // Diagonal movement (X moves left, Y moves down)
+  // Use timedMove for the small diagonal (lower left to upper right)
+  timedMove(-1, -1, sdiagTime);  // Diagonal movement (X moves left, Y moves down)
   normalStop();                         // Normal stop after the diagonal move
   setLEDState(false, true, false); // Yellow on
   checkLidStatus(); //Check status of LID
   checkRPM();
   delay(pauseTime);
 
-  // Use timedMoveDiagonal for the long diagonal (upper right to lower left)
-  timedMoveDiagonal(1, -1, ldiagTime);  // Diagonal movement (X moves right, Y moves down)
+  // Use timedMove for the long diagonal (upper right to lower left)
+  timedMove(1, -1, ldiagTime);  // Diagonal movement (X moves right, Y moves down)
   normalStop();                         // Normal stop after the diagonal move
   setLEDState(false, true, false); // Yellow on
   checkLidStatus(); //Check status of LID
@@ -552,17 +533,28 @@ void waitUntilSafeToProceed() {
 }
 
 void checkLidStatus() {
+  static bool wasLidOpen = false;
   bool lidOpen = digitalRead(LID_SENSOR_PIN) == LOW;
-  if (lidOpen) {
-    normalStop();  // Stop gracefully if the lid is open
+
+  if (lidOpen && !wasLidOpen) {
+    // Lid just opened — stop and lift pen
+    normalStop();
     moveServo(PEN_UP_ANGLE);
-    while (digitalRead(LID_SENSOR_PIN) == LOW) {
-      setLEDState(false, false, true);  // Blink red LED to indicate lid is open
-      delay(300);
-      setLEDState(false, false, false);
-      delay(300);
-    }
-    setLEDState(true, false, false);  // Turn green LED on once lid is closed
+    wasLidOpen = true;
+  }
+
+  while (digitalRead(LID_SENSOR_PIN) == LOW) {
+    setLEDState(false, false, true);  // Blink red
+    delay(300);
+    setLEDState(false, false, false);
+    delay(300);
+  }
+
+  if (wasLidOpen) {
+    // Lid just closed
+    Serial.println("Magnet detected. Resuming...");
+    setLEDState(true, false, false);
+    wasLidOpen = false;
   }
 }
 
@@ -579,7 +571,7 @@ void setup() {
   pinMode(EMERGENCY_STOP_PIN, INPUT_PULLUP);
   pinMode(ENCODER_Y_PIN, INPUT_PULLUP);
   pinMode(ENCODER_X_PIN, INPUT_PULLUP);
-  pinMode(LID_SENSOR_PIN, INPUT);
+  pinMode(LID_SENSOR_PIN, INPUT_PULLUP);
   pinMode(LED_GREEN, OUTPUT);
   pinMode(LED_YELLOW, OUTPUT);
   pinMode(LED_RED, OUTPUT);
@@ -650,6 +642,11 @@ void setup() {
   server.on("/pen/up", handlePenUp);
   server.on("/pen/down", handlePenDown);
   server.on("/auto-home", autoHome);
+  server.on("/start", []() {
+  drawNikolausHouse();
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "text/plain", "Drawing Nikolaus House");
+  });
   server.begin();
   Serial.println("HTTP server started");
 
@@ -674,35 +671,21 @@ void loop() {
     emergencyStop();  // Only emergency button triggers full stop
   }
 
-  // Pause if magnet is not detected near Hall sensor
-  if (digitalRead(LID_SENSOR_PIN) == LOW) {
-    normalStop();  // Graceful pause
-    Serial.println("Magnet lost. Pausing...");
-    while (digitalRead(LID_SENSOR_PIN) == LOW) {
-    setLEDState(false, false, true);  // Blink red
-    delay(300);
-    setLEDState(false, false, false);
-    delay(300);
-  }
-    Serial.println("Magnet detected. Resuming...");
-    setLEDState(true, false, false);  // Green
-  }
-
   // Listen for serial commands to control the plotter
-  if (Serial.available()) {
+  while (Serial.available()) {
     char cmd = Serial.read();
     switch (cmd) {
-      case 'n': drawNikolausHouse(); break;  // Draw the Nikolaus house
-      case 'u': moveServo(PEN_UP_ANGLE); break;  // Lift the pen
-      case 'l': moveServo(PEN_DOWN_ANGLE); break;  // Lower the pen
-      case 'h': autoHome(); break;  // Home the plotter
-      case 'c': calibrateMovement(); break;  // Calibrate the plotter
-    //WASD manual movements
-    case 'w': manualMove(0, 1); break;  // Move up (Y+)
-    case 's': manualMove(0, -1); break; // Move down (Y-)
-    case 'a': manualMove(1, 0); break; // Move left (X-)
-    case 'd': manualMove(-1, 0); break;  // Move right (X+)
-    case 'q': normalStop(); break;  // Stop motors
+      case 'n': drawNikolausHouse(); break;
+      case 'u': moveServo(PEN_UP_ANGLE); break;
+      case 'l': moveServo(PEN_DOWN_ANGLE); break;
+      case 'h': autoHome(); break;
+      case 'c': calibrateMovement(); break;
+      case 'w': manualMove(0, 1); break;
+      case 's': manualMove(0, -1); break;
+      case 'a': manualMove(1, 0); break;
+      case 'd': manualMove(-1, 0); break;
+      case 'q': manualModeActive = false; stopMotor(); break;
+      default: Serial.print("Unknown command: "); Serial.println(cmd); break;
     }
   }
 }
