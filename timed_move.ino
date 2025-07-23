@@ -39,9 +39,9 @@ WebServer server(80);
 #define LID_SENSOR_PIN 22
 
 // ------------------------ SERVO CONFIGURATION ------------------------
-#define SERVO_CHANNEL LEDC_CHANNEL_4       // Channel for servo PWM control
-#define SERVO_TIMER LEDC_TIMER_1           // Timer for servo control
-#define SERVO_FREQ 50                      // Frequency for servo control
+#define SERVO_CHANNEL LEDC_CHANNEL_4      // Channel for servo PWM control
+#define SERVO_TIMER LEDC_TIMER_1          // Timer for servo control
+#define SERVO_FREQ 50                     // Frequency for servo control
 #define SERVO_RES LEDC_TIMER_16_BIT       // Resolution for servo control
 #define SERVO_MIN_US 500                  // Minimum pulse width for servo (microseconds)
 #define SERVO_MAX_US 2500                 // Maximum pulse width for servo (microseconds)
@@ -51,16 +51,18 @@ WebServer server(80);
 int currentServoAngle = PEN_UP_ANGLE;   // Variable to store the current servo angle
 
 // ------------------------ MOTOR PWM CONFIG ------------------------
-volatile bool manualModeActive = false;
-#define RPM_TIMEOUT_US 250000UL  // 250 milliseconds (in microseconds)
-#define PWM_FREQ 1000                     // PWM frequency for motor control
-#define PWM_RESOLUTION_MOTOR LEDC_TIMER_8_BIT // PWM resolution for motor control
-#define PWM_TIMER LEDC_TIMER_0            // PWM timer for motor control
-#define PWM_SPEED_MODE LEDC_HIGH_SPEED_MODE // Use high-speed mode for PWM
-#define IN1_CHANNEL LEDC_CHANNEL_0        // PWM channel for IN1
-#define IN2_CHANNEL LEDC_CHANNEL_1        // PWM channel for IN2
-#define IN3_CHANNEL LEDC_CHANNEL_2        // PWM channel for IN3
-#define IN4_CHANNEL LEDC_CHANNEL_3        // PWM channel for IN4
+int manualDirX = 0;
+int manualDirY = 0;
+bool manualModeActive = false;
+#define RPM_TIMEOUT_US 250000UL                   // 250 milliseconds (in microseconds)
+#define PWM_FREQ 1000                             // PWM frequency for motor control
+#define PWM_RESOLUTION_MOTOR LEDC_TIMER_8_BIT     // PWM resolution for motor control
+#define PWM_TIMER LEDC_TIMER_0                    // PWM timer for motor control
+#define PWM_SPEED_MODE LEDC_HIGH_SPEED_MODE       // Use high-speed mode for PWM
+#define IN1_CHANNEL LEDC_CHANNEL_0                // PWM channel for IN1
+#define IN2_CHANNEL LEDC_CHANNEL_1                // PWM channel for IN2
+#define IN3_CHANNEL LEDC_CHANNEL_2                // PWM channel for IN3
+#define IN4_CHANNEL LEDC_CHANNEL_3                // PWM channel for IN4
 
 // ------------------------ ENCODER & PID ------------------------
 const int slotsPerRevolution = 20;      // Number of encoder slots per revolution for RPM calculation
@@ -75,14 +77,13 @@ float TARGET_RPM_X = 150;
 float TARGET_RPM_Y = 150;
 
 #define BASE_PWM 80   // Base PWM value for motor control
-#define MAX_PWM 220  // Safe max PWM to avoid overshoot
+#define MAX_PWM 250  // Safe max PWM to avoid overshoot
 
 // PID control constants (for tuning the speed control)
-float Kp = 10.0, Ki = 0.2, Kd = 0.25;  // Proportional, Integral, Derivative constants
+float Kp = 5.0, Ki = 0.2, Kd = 0.15;  // Proportional, Integral, Derivative constants: initial : 6, 0.2, 0.25
 float previousErrorY = 0, integralY = 0;
 float previousErrorX = 0, integralX = 0;
 
-float movementCorrectionFactor = 1.0;   // Correction factor for movement calibration
 Preferences preferences;                // For storing and retrieving preferences (like correction factor)
 
 // ------------------------ DEBOUNCE FUNCTION ------------------------
@@ -145,15 +146,21 @@ void stopMotor() {
     ledc_set_duty(PWM_SPEED_MODE, (ledc_channel_t)ch, 0);
     ledc_update_duty(PWM_SPEED_MODE, (ledc_channel_t)ch);
   }
-  Serial.println("Motor stopped");
 }
 
 // ------------------------ EMERGENCY STOP ------------------------
+volatile bool emergencyStopRequested = false;
 void emergencyStop() {
-  // Emergency stop function to immediately stop motors and lift the pen
-  stopMotor();                         // Stop all motors
-  moveServo(PEN_UP_ANGLE);             // Lift the pen to avoid damage
-  setLEDState(false, false, true);      // Turn on red LED for emergency indication
+  emergencyStopRequested = true;
+
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "text/plain", "Emergency Stop");
+  Serial.println("Received WiFi Command: Emergency Stop");
+
+  stopMotor();
+  moveServo(PEN_UP_ANGLE);
+  setLEDState(false, false, true);
+
   Serial.println("EMERGENCY STOP! Motors stopped and pen lifted.");
 
   // Reset RPM and PID state to prevent any movement after emergency stop
@@ -336,52 +343,6 @@ void handlePenDown() {
   Serial.println("Received WiFi Command: Pen DOWN");
 }
 
-// ------------------------ CALIBRATION ------------------------
-void calibrateMovement() {
-  const unsigned long calibrationMoveTime = 500; // Time for calibration move
-  Serial.println("Calibration: Drawing a horizontal line of 50mm...");
-
-  // Start homing to make sure plotter is at a known position
-  autoHome();  
-  // Turn on the yellow LED to indicate the calibration process is in progress
-  setLEDState(false, true, false); // Yellow on
-  moveServo(PEN_DOWN_ANGLE); delay(300);  // Lower the pen before starting
-
-  unsigned long startMove = millis();
-  while (millis() - startMove < calibrationMoveTime) {
-    // Check for emergency stop during calibration movement
-    if (digitalRead(EMERGENCY_STOP_PIN) == LOW) {
-      emergencyStop();  // Trigger emergency stop if the button is pressed
-      return;  // Exit the function immediately
-    }
-    driveX(1); delay(10);  // Move in X direction for calibration
-  }
-  stopMotor(); delay(300); // Stop motor after calibration move
-  moveServo(PEN_UP_ANGLE); delay(300);  // Lift the pen after calibration
-
-  // Prompt user for the measured distance
-  Serial.println("Enter measured line length in mm:");
-  String input = "";
-  while (!Serial.available()) delay(10);  // Wait for user input
-  while (Serial.available()) {
-    char c = Serial.read();
-    if (c == '\n') break;
-    input += c;
-  }
-
-  // Update correction factor based on user input
-  float measuredMM = input.toFloat();
-  if (measuredMM > 0) {
-    movementCorrectionFactor = 50.0 / measuredMM;  // Adjust correction factor
-    preferences.putFloat("corrFactor", movementCorrectionFactor);
-    Serial.print("New correction factor: ");
-    Serial.println(movementCorrectionFactor);
-  } else {
-    Serial.println("Invalid input.");
-  }
-  autoHome();  // Move back to the home position after calibration
-}
-
 void checkRPM() {
   unsigned long now = micros();
 
@@ -397,37 +358,22 @@ void checkRPM() {
   if (abs(yRPM - TARGET_RPM_Y) > 5) Serial.println("Warning: Y axis RPM deviates from target!");
 }
 
-// ------------------------ PID TUNING TEST ------------------------
-// Test PID tuning and print values in Arduino Serial Plotter compatible format
-void testPIDTuning() {
-  Serial.println("Starting PID tuning test...");
-  setTargetRPM(150, 0); // Only X axis for this test
-  for (int i = 0; i < 3; i++) {
-    unsigned long testTime = millis();
-    while (millis() - testTime < 3000) {
-      if (digitalRead(EMERGENCY_STOP_PIN) == LOW) {
-        emergencyStop();
-        return;
-      }
-      int direction = (i % 2 == 0) ? 1 : -1;
-      applyPID(xRPM, TARGET_RPM_X, integralX, previousErrorX, IN3_CHANNEL, IN4_CHANNEL, direction, X_LIMIT_RIGHT, X_LIMIT_LEFT);
-      // Output for Arduino Serial Plotter: xRPM and Target on one line (two series)
-      Serial.print("xRPM: "); Serial.print(xRPM);
-      Serial.print("\tTarget: "); Serial.println(TARGET_RPM_X);
-      delay(10);
-    }
-    stopMotor();
-    delay(1000);
-  }
-  stopMotor();
-  Serial.println("PID tuning test complete.");
-}
 
 // ------------------------ DRAWING ------------------------
+// Add this function to your code (put it before drawNikolausHouse)
+void nonBlockingDelay(unsigned long delayTime) {
+  unsigned long startTime = millis();
+  while (millis() - startTime < delayTime) {
+    server.handleClient(); // Check for web requests (like emergency stop)
+    if (emergencyStopRequested) return; // Exit immediately if emergency stop
+    delay(10); // Small delay to prevent overloading
+  }
+}
+
 void drawNikolausHouse() {
-  const unsigned long stepTime = 480;
-  const unsigned long sdiagTime = 230;
-  const unsigned long ldiagTime = 485;
+  const unsigned long stepTime = 400;
+  const unsigned long sdiagTime = 200;
+  const unsigned long ldiagTime = 405;
   const unsigned long pauseTime = 400;
 
   Serial.println("Drawing Nikolaus House...");
@@ -438,8 +384,9 @@ void drawNikolausHouse() {
   // Turn on the yellow LED to indicate the drawing process is in progress
   setLEDState(false, true, false); // Yellow on
   checkLidStatus(); //Check status of LID
-  moveServo(PEN_UP_ANGLE);  
-  delay(800);
+  moveServo(PEN_UP_ANGLE);
+  nonBlockingDelay(800);
+  if (emergencyStopRequested) return;
 
   setTargetRPM(150, 150);
   timedMove(0, 1, 300);  // Move in Y direction
@@ -447,86 +394,112 @@ void drawNikolausHouse() {
   setLEDState(false, true, false); // Yellow on
   checkLidStatus(); //Check status of LID
   checkRPM();
-  delay(300);
+  if (emergencyStopRequested) return;
+  nonBlockingDelay(300);
+  if (emergencyStopRequested) return;
 
   timedMove(1, 0, 200);  // Move in X direction
   normalStop();          // Normal stop after X move
   setLEDState(false, true, false); // Yellow on
   checkLidStatus(); //Check status of LID
   checkRPM();
-  delay(300);
+  if (emergencyStopRequested) return;
+  nonBlockingDelay(300);
+  if (emergencyStopRequested) return;
 
   setLEDState(false, true, false); // Yellow on
   checkLidStatus(); //Check status of LID
 
   moveServo(PEN_DOWN_ANGLE);  
-  delay(800);
+  nonBlockingDelay(800);
+  if (emergencyStopRequested) return;
 
+  setTargetRPM(150, 150);
   timedMove(1, 0, stepTime);  // Draw one side of the square
   normalStop();               // Normal stop after this move
   setLEDState(false, true, false); // Yellow on
   checkLidStatus(); //Check status of LID
   checkRPM();
-  delay(pauseTime);
+  if (emergencyStopRequested) return;
+  nonBlockingDelay(pauseTime);
+  if (emergencyStopRequested) return;
 
+  setTargetRPM(150, 150);
   timedMove(0, 1, stepTime);  // Draw the second side of the square
   normalStop();               // Normal stop after this move
   setLEDState(false, true, false); // Yellow on
   checkLidStatus(); //Check status of LID
   checkRPM();
-  delay(pauseTime);
+  if (emergencyStopRequested) return;
+  nonBlockingDelay(pauseTime);
+  if (emergencyStopRequested) return;
 
+  setTargetRPM(150, 150);
   timedMove(-1, 0, stepTime);  // Draw the third side of the square
   normalStop();                // Normal stop after this move
   setLEDState(false, true, false); // Yellow on
   checkLidStatus(); //Check status of LID
   checkRPM();
-  delay(pauseTime);
+  if (emergencyStopRequested) return;
+  nonBlockingDelay(pauseTime);
+  if (emergencyStopRequested) return;
 
+  setTargetRPM(150, 150);
   timedMove(0, -1, stepTime);  // Draw the fourth side of the square
   normalStop();               // Normal stop after this move
   setLEDState(false, true, false); // Yellow on
   checkLidStatus(); //Check status of LID
   checkRPM();
-  delay(pauseTime);
-
-  // Set target RPM for diagonal movements
-  setTargetRPM(150, 150);
-
+  if (emergencyStopRequested) return;
+  nonBlockingDelay(pauseTime);
+  if (emergencyStopRequested) return;
+  
   // Use timedMove for the long diagonal (lower left to upper right)
+  setTargetRPM(150, 150);
   timedMove(1, 1, ldiagTime);  // Diagonal movement (X and Y move simultaneously)
   normalStop();                        // Normal stop after the diagonal move
   setLEDState(false, true, false); // Yellow on
   checkLidStatus(); //Check status of LID
   checkRPM();
-  delay(pauseTime);
+  if (emergencyStopRequested) return;
+  nonBlockingDelay(800);
+  if (emergencyStopRequested) return;
 
   // Use timedMove for the small diagonal (upper right to lower left)
+  setTargetRPM(130, 130);
   timedMove(-1, 1, sdiagTime);  // Diagonal movement (X moves left, Y moves up)
   normalStop();                         // Normal stop after the diagonal move
   setLEDState(false, true, false); // Yellow on
   checkLidStatus(); //Check status of LID
   checkRPM();
-  delay(pauseTime);
+  if (emergencyStopRequested) return;
+  nonBlockingDelay(pauseTime);
+  if (emergencyStopRequested) return;
 
   // Use timedMove for the small diagonal (lower left to upper right)
+  setTargetRPM(130, 130);
   timedMove(-1, -1, sdiagTime);  // Diagonal movement (X moves left, Y moves down)
   normalStop();                         // Normal stop after the diagonal move
   setLEDState(false, true, false); // Yellow on
   checkLidStatus(); //Check status of LID
   checkRPM();
-  delay(pauseTime);
-
+  if (emergencyStopRequested) return;
+  nonBlockingDelay(pauseTime);
+  if (emergencyStopRequested) return;
+  
   // Use timedMove for the long diagonal (upper right to lower left)
   timedMove(1, -1, ldiagTime);  // Diagonal movement (X moves right, Y moves down)
   normalStop();                         // Normal stop after the diagonal move
   setLEDState(false, true, false); // Yellow on
   checkLidStatus(); //Check status of LID
   checkRPM();
-  delay(pauseTime);
+  if (emergencyStopRequested) return;
+  nonBlockingDelay(pauseTime);
+  if (emergencyStopRequested) return;
 
   moveServo(PEN_UP_ANGLE);  
-  delay(500);
+  nonBlockingDelay(500);
+  if (emergencyStopRequested) return;
   checkLidStatus(); //Check status of LID
   autoHome();  // Return to home position
 
@@ -584,6 +557,16 @@ void checkLidStatus() {
   }
 }
 
+void handleManualCommand(char cmd) {
+  switch (cmd) {
+    case 'w': manualDirY = 1; manualDirX = 0; manualModeActive = true; break;
+    case 's': manualDirY = -1; manualDirX = 0; manualModeActive = true; break;
+    case 'a': manualDirX = -1; manualDirY = 0; manualModeActive = true; break;
+    case 'd': manualDirX = 1; manualDirY = 0; manualModeActive = true; break;
+    case 'q': manualModeActive = false; stopMotor(); break;
+  }
+}
+
 // ------------------------ SETUP & LOOP ------------------------
 void setup() {
   delay(2000);
@@ -595,8 +578,8 @@ void setup() {
   pinMode(X_LIMIT_LEFT, INPUT_PULLUP);
   pinMode(X_LIMIT_RIGHT, INPUT_PULLUP);
   pinMode(EMERGENCY_STOP_PIN, INPUT_PULLUP);
-  pinMode(ENCODER_Y_PIN, INPUT_PULLUP);
-  pinMode(ENCODER_X_PIN, INPUT_PULLUP);
+  pinMode(ENCODER_Y_PIN, INPUT);
+  pinMode(ENCODER_X_PIN, INPUT);
   pinMode(LID_SENSOR_PIN, INPUT_PULLUP);
   pinMode(LED_GREEN, OUTPUT);
   pinMode(LED_YELLOW, OUTPUT);
@@ -643,12 +626,6 @@ void setup() {
   };
   ledc_channel_config(&servo_channel);
 
-  // Load saved preferences for movement correction factor
-  preferences.begin("plotter", false);
-  if (preferences.isKey("corrFactor")) {
-    movementCorrectionFactor = preferences.getFloat("corrFactor", 1.0);
-  }
-
   waitUntilSafeToProceed();  // Ensure safe state before continuing
   autoHome();  // Only start homing once safe
   delay(2000); // Give time for homing
@@ -668,11 +645,42 @@ void setup() {
   server.on("/pen/up", handlePenUp);
   server.on("/pen/down", handlePenDown);
   server.on("/auto-home", autoHome);
+  server.on("/emergency/activate", emergencyStop);
   server.on("/start", []() {
-  drawNikolausHouse();
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.send(200, "text/plain", "Drawing Nikolaus House");
+  drawNikolausHouse();
   });
+    // Manual motion endpoints
+        server.on("/move/up", []() {
+        server.sendHeader("Access-Control-Allow-Origin", "*");
+        server.send(200, "text/plain", "Moving up");
+        handleManualCommand('w');
+        });
+
+        server.on("/move/down", []() {
+        server.sendHeader("Access-Control-Allow-Origin", "*");
+        server.send(200, "text/plain", "Moving up");
+        handleManualCommand('s');
+        });
+
+        server.on("/move/left", []() {
+        server.sendHeader("Access-Control-Allow-Origin", "*");
+        server.send(200, "text/plain", "Moving up");
+        handleManualCommand('a');
+        });
+
+        server.on("/move/right", []() {
+        server.sendHeader("Access-Control-Allow-Origin", "*");
+        server.send(200, "text/plain", "Moving up");
+        handleManualCommand('d');
+        });
+
+        server.on("/move/stop", []() {
+        server.sendHeader("Access-Control-Allow-Origin", "*");
+        server.send(200, "text/plain", "Stopped");
+        handleManualCommand('q');
+        });
   server.begin();
   Serial.println("HTTP server started");
 
@@ -705,14 +713,26 @@ void loop() {
       case 'u': moveServo(PEN_UP_ANGLE); break;
       case 'l': moveServo(PEN_DOWN_ANGLE); break;
       case 'h': autoHome(); break;
-      case 'c': calibrateMovement(); break;
-      case 'w': manualMove(0, 1); break;
-      case 's': manualMove(0, -1); break;
-      case 'a': manualMove(1, 0); break;
-      case 'd': manualMove(-1, 0); break;
+      case 'w': manualDirY = 1; manualDirX = 0; manualModeActive = true; break;
+      case 's': manualDirY = -1; manualDirX = 0; manualModeActive = true; break;
+      case 'a': manualDirX = -1; manualDirY = 0; manualModeActive = true; break;
+      case 'd': manualDirX = 1; manualDirY = 0; manualModeActive = true; break;
       case 'q': manualModeActive = false; stopMotor(); break;
-      case 't': testPIDTuning(); break;
       default: Serial.print("Unknown command: "); Serial.println(cmd); break;
     }
+  }
+  // Handle manual movement if active
+  if (manualModeActive) {
+    if ((manualDirX > 0 && digitalRead(X_LIMIT_RIGHT) == LOW) ||
+        (manualDirX < 0 && digitalRead(X_LIMIT_LEFT) == LOW) ||
+        (manualDirY > 0 && digitalRead(Y_LIMIT_TOP) == LOW) ||
+        (manualDirY < 0 && digitalRead(Y_LIMIT_BOTTOM) == LOW)) {
+      stopMotor();
+      manualModeActive = false;
+    } else {
+      applyPID(xRPM, TARGET_RPM_X, integralX, previousErrorX, IN3_CHANNEL, IN4_CHANNEL, manualDirX, X_LIMIT_RIGHT, X_LIMIT_LEFT);
+      applyPID(yRPM, TARGET_RPM_Y, integralY, previousErrorY, IN1_CHANNEL, IN2_CHANNEL, manualDirY, Y_LIMIT_TOP, Y_LIMIT_BOTTOM);
+    }
+    delay(5);
   }
 }
