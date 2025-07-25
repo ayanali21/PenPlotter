@@ -80,7 +80,7 @@ float TARGET_RPM_Y = 150;
 #define MAX_PWM 250  // Safe max PWM to avoid overshoot
 
 // PID control constants (for tuning the speed control)
-float Kp = 5.0, Ki = 0.2, Kd = 0.15;  // Proportional, Integral, Derivative constants
+float Kp = 10.0, Ki = 0.2, Kd = 0.10;  // Proportional, Integral, Derivative constants
 float previousErrorY = 0, integralY = 0;
 float previousErrorX = 0, integralX = 0;
 
@@ -388,7 +388,7 @@ void drawNikolausHouse() {
   if (emergencyStopRequested) return;
 
   setTargetRPM(150, 150);
-  timedMove(0, 1, 1000);  // Move in Y direction
+  timedMove(0, 1, 600);  // Move in Y direction
   normalStop(); // Normal stop after Y move
   setLEDState(false, true, false); // Yellow on
   checkLidStatus(); //Check status of LID
@@ -454,8 +454,8 @@ void drawNikolausHouse() {
   if (emergencyStopRequested) return;
  
   // Use timedMove for the long diagonal (lower left to upper right)
-  setTargetRPM(255, 225);
-  timedMove(1, 1, 478);  // Diagonal movement (X and Y move simultaneously)
+  setTargetRPM(110, 110);
+  timedMove(1, 1, 520);  // Diagonal movement (X and Y move simultaneously)
   normalStop();                        // Normal stop after the diagonal move
   setLEDState(false, true, false); // Yellow on
   checkLidStatus(); //Check status of LID
@@ -463,7 +463,7 @@ void drawNikolausHouse() {
   if (emergencyStopRequested) return;
   nonBlockingDelay(800);
   if (emergencyStopRequested) return;
- /*
+
   // Use timedMove for the small diagonal (upper right to lower left)
   setTargetRPM(130, 130);
   timedMove(-1, 1, sdiagTime);  // Diagonal movement (X moves left, Y moves up)
@@ -495,7 +495,7 @@ void drawNikolausHouse() {
   if (emergencyStopRequested) return;
   nonBlockingDelay(pauseTime);
   if (emergencyStopRequested) return;
-*/
+
   moveServo(PEN_UP_ANGLE);  
   nonBlockingDelay(500);
   if (emergencyStopRequested) return;
